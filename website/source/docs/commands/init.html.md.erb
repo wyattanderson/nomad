@@ -8,18 +8,20 @@ description: >
 
 # Command: init
 
-The `init` command creates an example [job specification](/docs/jobspec/) in the current
-directory that demonstrates some common configurations for tasks, task groups,
-runtime constraints, and resource allocation.
+The `init` command creates an example [job specification](/docs/jobspec/) in the
+current directory that demonstrates some common configurations for tasks, task
+groups, runtime constraints, and resource allocation. If passed a docker image,
+the `init` command produces an example job file that runs that particular docker
+image.
 
 Please refer to the [jobspec](/docs/jobspec/) and [drivers](/docs/drivers/)
-pages to learn how to customize the template.
+pages to learn how to further customize the template.
 
 ## Examples
 
-Generate an example job file:
+Generate an example job file running the docker `redis:3.0.5` image:
 
 ```
-$ nomad init
-Example job file written to example.nomad
+$ nomad init redis:3.0.5
+Example job file written to redis-3-0-5.nomad
 ```
