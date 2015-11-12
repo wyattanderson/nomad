@@ -5,12 +5,25 @@ import (
 	"io/ioutil"
 	"os"
 	"strings"
+	"unicode"
 )
 
 const (
 	// DefaultInitName is the default name we use when
 	// initializing the example file
 	DefaultInitName = "example.nomad"
+
+	// DefaultGroup is the default group name we use when
+	// initializing the example file
+	DefaultGroup = "cache"
+
+	// DefaultTask is the default task name we use when
+	// initializing the example file
+	DefaultTask = "redis"
+
+	// DefaultImage is the default docker image we use when
+	// initializing the example file if a user doesn't override it.
+	DefaultImage = "redis:latest"
 )
 
 // InitCommand generates a new job template that you can customize to your
@@ -21,10 +34,12 @@ type InitCommand struct {
 
 func (c *InitCommand) Help() string {
 	helpText := `
-Usage: nomad init
+Usage: nomad init [docker-image]
 
   Creates an example job file that can be used as a starting
-  point to customize further.
+  point to customize further. If a docker image is specified,
+  a job running that image will be created, otherwise a 
+  default docker image will be used.
 `
 	return strings.TrimSpace(helpText)
 }
@@ -34,36 +49,105 @@ func (c *InitCommand) Synopsis() string {
 }
 
 func (c *InitCommand) Run(args []string) int {
+	flags := c.Meta.FlagSet("init", FlagSetClient)
+	flags.Usage = func() { c.Ui.Output(c.Help()) }
+	if err := flags.Parse(args); err != nil {
+		return 1
+	}
+
 	// Check for misuse
-	if len(args) != 0 {
+	if len(args) > 1 {
+		c.Ui.Error(c.Help())
+		return 1
+	}
+
+	dockerImg := DefaultImage
+	filename := DefaultInitName
+	group := DefaultGroup
+	task := DefaultTask
+	if len(args) == 1 {
+		dockerImg = args[0]
+		filename = c.buildFilename(dockerImg)
+		group, task = c.parseGroupAndTask(dockerImg)
+	}
+
+	// Validate the image.
+	if len(dockerImg) == 0 {
 		c.Ui.Error(c.Help())
 		return 1
 	}
 
 	// Check if the file already exists
-	_, err := os.Stat(DefaultInitName)
-	if err != nil && !os.IsNotExist(err) {
-		c.Ui.Error(fmt.Sprintf("Failed to stat '%s': %v", DefaultInitName, err))
-		return 1
-	}
-	if !os.IsNotExist(err) {
-		c.Ui.Error(fmt.Sprintf("Job '%s' already exists", DefaultInitName))
+	if err := c.checkExists(filename); err != nil {
+		c.Ui.Error(err.Error())
 		return 1
 	}
 
 	// Write out the example
-	err = ioutil.WriteFile(DefaultInitName, []byte(defaultJob), 0660)
+	job := []byte(c.buildJob(group, task, dockerImg))
+	err := ioutil.WriteFile(filename, job, 0660)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to write '%s': %v", DefaultInitName, err))
+		c.Ui.Error(fmt.Sprintf("Failed to write '%s': %v", filename, err))
 		return 1
 	}
 
 	// Success
-	c.Ui.Output(fmt.Sprintf("Example job file written to %s", DefaultInitName))
+	c.Ui.Output(fmt.Sprintf("Example job file written to %s", filename))
 	return 0
 }
 
-var defaultJob = strings.TrimSpace(`
+// buildJob returns a job with the specified docker image
+func (c *InitCommand) buildJob(group, task, image string) string {
+	return fmt.Sprintf(templateJob, group, group, task, image)
+}
+
+// buildFilename creates a filename based on the image name.
+func (c *InitCommand) buildFilename(image string) string {
+	filename := make([]rune, len(image))
+	for i, c := range image {
+		if !(unicode.IsLetter(c) || unicode.IsNumber(c)) {
+			filename[i] = '-'
+		} else {
+			filename[i] = c
+		}
+	}
+
+	return fmt.Sprintf("%v.nomad", string(filename))
+}
+
+// parseGroupAndTask takes an image name and returns an appropriate group and
+// task name.
+func (c *InitCommand) parseGroupAndTask(image string) (group, task string) {
+	hashIndex := strings.LastIndex(image, "@")
+	colonIndex := strings.LastIndex(image, ":")
+	if hashIndex != -1 {
+		image = image[:hashIndex]
+	} else if colonIndex != -1 {
+		image = image[:colonIndex]
+	}
+
+	parts := strings.Split(image, "/")
+	if len(parts) == 1 {
+		return parts[0], parts[0]
+	}
+
+	return parts[0], parts[1]
+}
+
+// checkExists returns an error if the passed filename exists.
+func (c *InitCommand) checkExists(name string) error {
+	_, err := os.Stat(name)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("Failed to stat '%s': %v", name, err)
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("Job '%s' already exists", name)
+	}
+	return nil
+}
+
+// Templated default job.
+var templateJob = strings.TrimSpace(`
 # There can only be a single job definition per file.
 # Create a job with ID and Name 'example'
 job "example" {
@@ -74,7 +158,8 @@ job "example" {
 	datacenters = ["dc1"]
 
 	# Service type jobs optimize for long-lived services. This is
-	# the default but we can change to batch for short-lived tasks.
+	# the default but we can change to "batch" for short-lived tasks or
+	# "system" to run this job on every node.
 	# type = "service"
 
 	# Priority controls our access to resources and scheduling priority.
@@ -97,9 +182,9 @@ job "example" {
 		max_parallel = 1
 	}
 
-	# Create a 'cache' group. Each task in the group will be
+	# Create a '%v' group. Each task in the group will be
 	# scheduled onto the same machine.
-	group "cache" {
+	group "%v" {
 		# Control the number of instances of this groups.
 		# Defaults to 1
 		# count = 1
@@ -116,13 +201,13 @@ job "example" {
 		}
 
 		# Define a task to run
-		task "redis" {
+		task "%v" {
 			# Use Docker to run the task.
 			driver = "docker"
 
 			# Configure Docker driver with the image
 			config {
-				image = "redis:latest"
+				image = "%v"
 			}
 
 			# We must specify the resources required for
