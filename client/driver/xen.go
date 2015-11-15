@@ -4,17 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/nomad/structs"
-	// "github.com/hashicorp/nomad/client/driver/executor"
-	"github.com/hashicorp/nomad/client/fingerprint"
 	"os/exec"
 	"regexp"
-	// "strings"
+	"strings"
+
+	"github.com/hashicorp/nomad/client/config"
+	"github.com/hashicorp/nomad/client/fingerprint"
+	"github.com/hashicorp/nomad/nomad/structs"
 )
 
 var (
-	reXenInfo = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>\S+)`)
+	reXenInfo = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>.+)`)
 )
 
 type XenDriver struct {
@@ -34,11 +34,16 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 		return false, nil
 	}
 
-	var xenCfg map[string]string
+	xenCfg := make(map[string]string)
 	scanner := bufio.NewScanner(bytes.NewReader(outBytes))
 	for scanner.Scan() {
-		matches := reXenInfo.FindStringSubmatch(scanner.Text())
-		xenCfg[matches[0]] = matches[1]
+		text := strings.TrimSpace(scanner.Text())
+		matches := reXenInfo.FindStringSubmatch(text)
+		if len(matches) != 3 {
+			d.logger.Printf("[DEBUG] driver.xen: unexpected xl info output %q", matches)
+			continue
+		}
+		xenCfg[matches[1]] = matches[2]
 	}
 
 	_, ok := xenCfg["xen_version"]
