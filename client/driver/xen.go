@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/nomad/client/config"
@@ -22,8 +23,35 @@ type XenDriver struct {
 	fingerprint.StaticFingerprinter
 }
 
+type XenInfo map[string]string
+
 func NewXenDriver(ctx *DriverContext) Driver {
 	return &XenDriver{DriverContext: *ctx}
+}
+
+// We need to override resource fingerprinting here because the default Nomad
+// fingerprinting will count the resources in the dom0 which may be limited or
+// incorrect.
+func (d *XenDriver) fingerprintDom0(node *structs.Node, xen XenInfo) {
+	if node.Resources == nil {
+		node.Resources = &structs.Resources{}
+	}
+
+	cpuMhz, _ := strconv.ParseFloat(xen["cpu_mhz"], 64)
+	node.Attributes["cpu.frequency"] = fmt.Sprintf("%.6f", cpuMhz)
+
+	numCores, _ := strconv.ParseInt(xen["nr_cpus"], 10, 32)
+	node.Attributes["cpu.numcores"] = fmt.Sprintf("%d", numCores)
+
+	totalCompute := cpuMhz * float64(numCores)
+	node.Attributes["cpu.totalcompute"] = fmt.Sprintf("%.6f", totalCompute)
+	node.Resources.CPU = int(totalCompute)
+
+	totalMemoryMB, _ := strconv.ParseInt(xen["total_memory"], 10, 32)
+	if totalMemoryMB > 0 {
+		node.Attributes["memory.totalbytes"] = fmt.Sprintf("%d", totalMemoryMB*1024*1024)
+		node.Resources.MemoryMB = int(totalMemoryMB)
+	}
 }
 
 func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
@@ -34,7 +62,7 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 		return false, nil
 	}
 
-	xenCfg := make(map[string]string)
+	xenCfg := make(XenInfo)
 	scanner := bufio.NewScanner(bytes.NewReader(outBytes))
 	for scanner.Scan() {
 		text := strings.TrimSpace(scanner.Text())
@@ -55,6 +83,8 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 	for key, value := range xenCfg {
 		node.Attributes[fmt.Sprintf("driver.xen.%s", key)] = value
 	}
+
+	d.fingerprintDom0(node, xenCfg)
 
 	return true, nil
 }
