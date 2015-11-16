@@ -4,10 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
+	"time"
 
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/fingerprint"
@@ -15,12 +20,31 @@ import (
 )
 
 var (
-	reXenInfo = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>.+)`)
+	reXenInfo    = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>.+)`)
+	reXenStoreLs = regexp.MustCompile(`/local/domain/(?P<domainId>\d+)/(?P<key>\w+) = "(?P<value>.*)"`)
 )
 
 type XenDriver struct {
 	DriverContext
 	fingerprint.StaticFingerprinter
+}
+
+type xenHandle struct {
+	domainName string
+	logger     *log.Logger
+	waitCh     chan error
+	doneCh     chan struct{}
+}
+
+type xenPid struct {
+	domainName string
+}
+
+type xenDomainConfig struct {
+	Name       string
+	CPUCount   int
+	Memory     int
+	MACAddress string
 }
 
 type XenInfo map[string]string
@@ -90,9 +114,110 @@ func (d *XenDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, e
 }
 
 func (d *XenDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
-	return nil, fmt.Errorf("not implemented")
+	return nil, fmt.Errorf("open not implemented")
 }
 
 func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
-	return nil, fmt.Errorf("not implemented")
+	cfgFile, err := template.ParseFiles("/home/wyatt/test.tmpl")
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't load config file template")
+	}
+
+	domainName := fmt.Sprintf("nomad-%s", ctx.AllocID)
+	domainConfig := xenDomainConfig{
+		Name:       domainName,
+		CPUCount:   1,                   // TODO use the resources
+		Memory:     512,                 // TODO use resources
+		MACAddress: "00:16:3e:d9:96:f0", // TODO generate this
+	}
+
+	local, ok := ctx.AllocDir.TaskDirs[task.Name]
+	if !ok {
+		return nil, fmt.Errorf("No local task dir for %v", task.Name)
+	}
+	d.logger.Printf("local task dir %s", local)
+
+	cfgFilePath := filepath.Join(local, fmt.Sprintf("nomad-%s.cfg", ctx.AllocID))
+	cfgFileHandle, err := os.Create(cfgFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO rename all these templates lol
+	err = cfgFile.ExecuteTemplate(cfgFileHandle, "test.tmpl", domainConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	h := &xenHandle{
+		domainName: domainName,
+		logger:     d.logger,
+		doneCh:     make(chan struct{}),
+		waitCh:     make(chan error, 1),
+	}
+
+	xlCmd := exec.Command("xl", "create", cfgFilePath)
+	xlCmd.Run()
+
+	go h.run()
+	return h, nil
+}
+
+func (h *xenHandle) ID() string {
+	// TODO do it lol
+	return "nope not yet"
+}
+
+func (h *xenHandle) WaitCh() chan error {
+	return h.waitCh
+}
+
+func (h *xenHandle) Update(task *structs.Task) error {
+	// Update is not possible
+	return nil
+}
+
+func (h *xenHandle) Kill() error {
+	killCmd := exec.Command("xl", "destroy", h.domainName)
+	killCmd.Run()
+
+	return nil
+}
+
+// TODO this is super hacky but i really don't want to deal with parsing
+// xenstore into a tree structure right now for POC sake
+func (h *xenHandle) isDomainActive() bool {
+	// TODO move this to using libxenlight or xenbus or something as
+	// opposed to parsing command output
+	outBytes, err := exec.Command("xenstore-ls", "/local/domain", "-f").Output()
+	if err != nil {
+		panic(err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(outBytes))
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		matches := reXenStoreLs.FindStringSubmatch(text)
+		if len(matches) != 4 {
+			continue
+		}
+
+		if matches[2] == "name" && matches[3] == h.domainName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (h *xenHandle) run() {
+	for {
+		time.Sleep(5 * time.Second)
+		if !h.isDomainActive() {
+			break
+		}
+	}
+
+	close(h.doneCh)
+	close(h.waitCh)
 }
