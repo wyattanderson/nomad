@@ -19,6 +19,8 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
+const xenMacPrefix = "00:16:3E"
+
 var (
 	reXenInfo    = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>.+)`)
 	reXenStoreLs = regexp.MustCompile(`/local/domain/(?P<domainId>\d+)/(?P<key>\w+) = "(?P<value>.*)"`)
@@ -123,12 +125,18 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, fmt.Errorf("Couldn't load config file template")
 	}
 
+	// TODO this assumes the allocation ID is random enough to use as
+	// a MAC address basis
+	hexAllocId := strings.Replace(ctx.AllocID, "-", "", -1)
+	macAddress := fmt.Sprintf(
+		"%s:%s:%s:%s", xenMacPrefix, hexAllocId[0:2], hexAllocId[2:4], hexAllocId[4:6])
+
 	domainName := fmt.Sprintf("nomad-%s", ctx.AllocID)
 	domainConfig := xenDomainConfig{
 		Name:       domainName,
-		CPUCount:   1,                   // TODO use the resources
-		Memory:     512,                 // TODO use resources
-		MACAddress: "00:16:3e:d9:96:f0", // TODO generate this
+		CPUCount:   1, // TODO use the resources
+		Memory:     task.Resources.MemoryMB,
+		MACAddress: macAddress,
 	}
 
 	local, ok := ctx.AllocDir.TaskDirs[task.Name]
@@ -165,7 +173,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 
 func (h *xenHandle) ID() string {
 	// TODO do it lol
-	return "nope not yet"
+	panic("fuck")
 }
 
 func (h *xenHandle) WaitCh() chan error {
