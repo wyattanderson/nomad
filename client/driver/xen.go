@@ -14,6 +14,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -32,10 +33,11 @@ type XenDriver struct {
 }
 
 type xenHandle struct {
-	domainName string
-	logger     *log.Logger
-	waitCh     chan error
-	doneCh     chan struct{}
+	domainName   string
+	consulPrefix string
+	logger       *log.Logger
+	waitCh       chan error
+	doneCh       chan struct{}
 }
 
 type xenPid struct {
@@ -47,12 +49,23 @@ type xenDomainConfig struct {
 	CPUCount   int
 	Memory     int
 	MACAddress string
+	Disks      []string
 }
 
 type XenInfo map[string]string
 
 func NewXenDriver(ctx *DriverContext) Driver {
 	return &XenDriver{DriverContext: *ctx}
+}
+
+func getKVClient() *api.KV {
+	client, err := api.NewClient(api.DefaultConfig())
+	if err != nil {
+		panic(err)
+	}
+
+	kv := client.KV()
+	return kv
 }
 
 // We need to override resource fingerprinting here because the default Nomad
@@ -119,17 +132,56 @@ func (d *XenDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error
 	return nil, fmt.Errorf("open not implemented")
 }
 
+func (d *XenDriver) qcowImageFromBase(ctx *ExecContext, task *structs.Task, baseImagePath string, allocId string) (string, error) {
+	if _, err := os.Stat(baseImagePath); err != nil {
+		return "", err
+	}
+
+	if task.Resources.DiskMB == 0 {
+		return "", fmt.Errorf("Disk resources must be greater than 0")
+	}
+
+	local, _ := ctx.AllocDir.TaskDirs[task.Name]
+	imagePath := filepath.Join(local, fmt.Sprintf("disk-%s.qcow2", allocId))
+	imageSize := fmt.Sprintf("%dM", task.Resources.DiskMB)
+
+	qemuImgCmd := exec.Command(
+		"qemu-img", "create", "-b", baseImagePath, "-f", "qcow2",
+		"-o", "compat=0.10,backing_fmt=qcow2", imagePath, imageSize)
+	d.logger.Printf("qemu cmd: %q", qemuImgCmd.Args)
+	err := qemuImgCmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return imagePath, nil
+}
+
 func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
 	cfgFile, err := template.ParseFiles("/home/wyatt/test.tmpl")
 	if err != nil {
 		return nil, fmt.Errorf("Couldn't load config file template")
 	}
 
+	baseImagePath, ok := task.Config["base_image_path"]
+	if !ok || baseImagePath == "" {
+		return nil, fmt.Errorf("Base image path must be specified.")
+	}
+
+	imagePath, err := d.qcowImageFromBase(ctx, task, baseImagePath, ctx.AllocID)
+	if imagePath == "" || err != nil {
+		return nil, err
+	}
+
+	disks := []string{
+		imagePath,
+	}
+
 	// TODO this assumes the allocation ID is random enough to use as
 	// a MAC address basis
 	hexAllocId := strings.Replace(ctx.AllocID, "-", "", -1)
-	macAddress := fmt.Sprintf(
-		"%s:%s:%s:%s", xenMacPrefix, hexAllocId[0:2], hexAllocId[2:4], hexAllocId[4:6])
+	macAddress := strings.ToLower(fmt.Sprintf(
+		"%s:%s:%s:%s", xenMacPrefix, hexAllocId[0:2], hexAllocId[2:4], hexAllocId[4:6]))
 
 	domainName := fmt.Sprintf("nomad-%s", ctx.AllocID)
 	domainConfig := xenDomainConfig{
@@ -137,6 +189,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		CPUCount:   1, // TODO use the resources
 		Memory:     task.Resources.MemoryMB,
 		MACAddress: macAddress,
+		Disks:      disks,
 	}
 
 	local, ok := ctx.AllocDir.TaskDirs[task.Name]
@@ -157,23 +210,33 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, err
 	}
 
+	// set instance ID in consul
+	kv := getKVClient()
+	kvPair := &api.KVPair{
+		Key:   fmt.Sprintf("%s/meta-data/instance-id", macAddress),
+		Value: []byte(ctx.AllocID),
+	}
+	kv.Put(kvPair, nil)
+
 	h := &xenHandle{
-		domainName: domainName,
-		logger:     d.logger,
-		doneCh:     make(chan struct{}),
-		waitCh:     make(chan error, 1),
+		consulPrefix: fmt.Sprintf("%s/", macAddress),
+		domainName:   domainName,
+		logger:       d.logger,
+		doneCh:       make(chan struct{}),
+		waitCh:       make(chan error, 1),
 	}
 
 	xlCmd := exec.Command("xl", "create", cfgFilePath)
-	xlCmd.Run()
+	if err := xlCmd.Run(); err != nil {
+		return nil, err
+	}
 
 	go h.run()
 	return h, nil
 }
 
 func (h *xenHandle) ID() string {
-	// TODO do it lol
-	panic("fuck")
+	return h.domainName
 }
 
 func (h *xenHandle) WaitCh() chan error {
@@ -188,6 +251,11 @@ func (h *xenHandle) Update(task *structs.Task) error {
 func (h *xenHandle) Kill() error {
 	killCmd := exec.Command("xl", "destroy", h.domainName)
 	killCmd.Run()
+
+	// clear instance ID in consul. maybe worth leaving this around? idk,
+	// i doubt it
+	kv := getKVClient()
+	kv.DeleteTree(h.consulPrefix, nil)
 
 	return nil
 }
