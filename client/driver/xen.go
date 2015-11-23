@@ -11,32 +11,41 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/template"
 	"time"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/nomad/client/config"
+	cstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/mitchellh/mapstructure"
 )
 
 const xenMacPrefix = "00:16:3E"
 
+type XenDriverConfig struct {
+	BaseImagePath string `mapstructure:"base_image_path"`
+}
+
 var (
-	reXenInfo    = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>.+)`)
-	reXenStoreLs = regexp.MustCompile(`/local/domain/(?P<domainId>\d+)/(?P<key>\w+) = "(?P<value>.*)"`)
+	reXenInfo            = regexp.MustCompile(`(?P<key>\w+)\s+:\s+(?P<value>.+)`)
+	reXenStoreLs         = regexp.MustCompile(`/local/domain/(?P<domainId>\d+)/(?P<key>\w+) = "(?P<value>.*)"`)
+	reXenStoreDomainName = regexp.MustCompile(`/local/domain/(?P<domainId>\d+)$`)
 )
 
 type XenDriver struct {
 	DriverContext
 	fingerprint.StaticFingerprinter
+	xsDomCh chan xsDomInfo
 }
 
 type xenHandle struct {
 	domainName   string
 	consulPrefix string
 	logger       *log.Logger
-	waitCh       chan error
+	waitCh       chan *cstructs.WaitResult
 	doneCh       chan struct{}
 }
 
@@ -55,7 +64,15 @@ type xenDomainConfig struct {
 type XenInfo map[string]string
 
 func NewXenDriver(ctx *DriverContext) Driver {
-	return &XenDriver{DriverContext: *ctx}
+	c := make(chan xsDomInfo)
+	go watchXenstore(c)
+
+	driver := &XenDriver{
+		DriverContext: *ctx,
+		xsDomCh:       c,
+	}
+
+	return driver
 }
 
 func getKVClient() *api.KV {
@@ -66,6 +83,62 @@ func getKVClient() *api.KV {
 
 	kv := client.KV()
 	return kv
+}
+
+type xsDomInfo struct {
+	DomainId   int
+	DomainName string
+}
+
+func getInstanceInfo(path string, domainId int) xsDomInfo {
+	namePath := fmt.Sprintf("%s/name", path)
+	outputBytes, err := exec.Command("xenstore-read", namePath).Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			waitStatus := exitError.Sys().(syscall.WaitStatus)
+			if waitStatus.ExitStatus() == 1 {
+				return xsDomInfo{
+					DomainId:   domainId,
+					DomainName: "",
+				}
+			}
+		}
+	}
+
+	return xsDomInfo{
+		DomainId:   domainId,
+		DomainName: strings.TrimSpace(string(outputBytes)),
+	}
+}
+
+// Watches the xenstore to look for domains starting and stopping so that we
+// can track job state internally.
+func watchXenstore(c chan xsDomInfo) {
+	cmd := exec.Command("xenstore-watch", "/local/domain")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		panic(err)
+	}
+
+	cmd.Start()
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		matches := reXenStoreDomainName.FindStringSubmatch(text)
+		if len(matches) != 2 {
+			continue
+		}
+
+		// If we have a match at this point, we've seen a key change
+		// for the domain name. Now we check to see if the domain
+		// exists. If it doesn't, the domain stopped. If it does, we
+		// know the name, from which we can derive the allocation ID.
+		domainId, _ := strconv.ParseInt(matches[1], 10, 32)
+		xsd := getInstanceInfo(matches[0], int(domainId))
+		c <- xsd
+	}
+
+	close(c)
 }
 
 // We need to override resource fingerprinting here because the default Nomad
@@ -163,8 +236,13 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		return nil, fmt.Errorf("Couldn't load config file template")
 	}
 
-	baseImagePath, ok := task.Config["base_image_path"]
-	if !ok || baseImagePath == "" {
+	var driverConfig XenDriverConfig
+	if err := mapstructure.WeakDecode(task.Config, &driverConfig); err != nil {
+		return nil, err
+	}
+
+	baseImagePath := driverConfig.BaseImagePath
+	if baseImagePath == "" {
 		return nil, fmt.Errorf("Base image path must be specified.")
 	}
 
@@ -223,7 +301,7 @@ func (d *XenDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, e
 		domainName:   domainName,
 		logger:       d.logger,
 		doneCh:       make(chan struct{}),
-		waitCh:       make(chan error, 1),
+		waitCh:       make(chan *cstructs.WaitResult, 1),
 	}
 
 	xlCmd := exec.Command("xl", "create", cfgFilePath)
@@ -239,7 +317,7 @@ func (h *xenHandle) ID() string {
 	return h.domainName
 }
 
-func (h *xenHandle) WaitCh() chan error {
+func (h *xenHandle) WaitCh() chan *cstructs.WaitResult {
 	return h.waitCh
 }
 
@@ -267,7 +345,8 @@ func (h *xenHandle) isDomainActive() bool {
 	// opposed to parsing command output
 	outBytes, err := exec.Command("xenstore-ls", "/local/domain", "-f").Output()
 	if err != nil {
-		panic(err)
+		// gross but better than exploding
+		return true
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(outBytes))
